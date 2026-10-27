@@ -1,0 +1,135 @@
+<!--
+  Nginx Proxy Manager (NPM) -> Wazuh decoders.
+
+  SOURCE: NPM's own nginx log files, read by a Wazuh agent on the NPM host
+          (<localfile> log_format syslog on <npm data dir>/logs/*_access.log and *_error.log),
+          or (optional) the same lines relayed over RFC 3164 syslog with program name npm-proxy
+          (see the npm-syslog decoders at the end). Both paths produce identical fields.
+
+  ACCESS LOG FORMATS (log_format "proxy" and "standard" in NPM's nginx.conf):
+    Both formats are decoded whatever the file is called.
+    proxy    (proxy hosts, proxy-host-*_access.log):
+      [01/Jan/2026:12:00:00 +0000] - 502 502 - GET https app.example.com "/path" [Client 203.0.113.10] [Length 154] [Gzip -] [Sent-to 198.51.100.20] "Mozilla/5.0" "-"
+      time_local, cache status, upstream status, status, method, scheme, host, request URI,
+      client, bytes, gzip ratio, upstream (Sent-to), user agent, referer
+    standard (no upstream; e.g. redirection / 404 hosts):
+      [01/Jan/2026:12:00:00 +0000] 301 - GET http app.example.com "/path" [Client 203.0.113.10] [Length 0] [Gzip -] "Mozilla/5.0" "-"
+
+  FIELDS (indexed as data.<name>):
+    srcip      client address (canonical: IP-IOC rules and same_source_ip work)
+    status     HTTP status returned to the client (canonical)
+    url        request URI including the query string (canonical)
+    npm.method, npm.scheme, npm.host, npm.upstream (Sent-to), npm.upstream_status, npm.cache,
+    npm.bytes, npm.user_agent, npm.referer
+
+  WHY THESE ARE CHILDREN OF THE STOCK 'zeus' DECODER (verified with wazuh-logtest on 4.14.5):
+    The stock ruleset ships a decoder for the long-discontinued Zeus web server whose prematch is
+    any line starting with an nginx-style bracketed timestamp ("[01/Jan/2026:12:00:00 +0000] ").
+    Stock decoders load before etc/decoders and the first matching parent wins, so a separate
+    parent decoder for NPM can never match. The NPM decoders are therefore children of 'zeus':
+      - alerts show decoder.name "zeus"; rules and the dashboard key on rule IDs / groups instead;
+      - the stock Zeus rules (31200-31251) need "INFO:/WARN:/SERIOUS:/FATAL:" right after the
+        timestamp, so they never match NPM lines; 101700 hangs off 31200 and is keyed on a field
+        only these decoders set (npm.scheme);
+      - a decoder that has children no longer runs its own <regex>, so 'npm-zeus-compat' below
+        re-adds the stock Zeus "host=" srcip extraction unchanged (no-op for NPM lines).
+    Children read the text AFTER the parent prematch (offset="after_parent"), i.e. from the
+    field following the timestamp. This only applies to lines WITHOUT a syslog header (agent
+    file collection, or a relay that forwards the bare line).
+
+  OTHER NOTES:
+    - Some syslog relays escape double quotes (\"); every quote in the regexes accepts an optional
+      backslash. nginx itself writes a literal quote inside a field as \x22, so quoted fields
+      never contain a bare quote.
+    - Malformed requests (TLS on plain HTTP, scanner garbage) can log an empty method/host; those
+      tokens are \S* so the line still decodes.
+
+  ERROR LOG: NPM error lines are plain nginx error-log lines and are already decoded by the stock
+  'nginx-errorlog' decoder (srcip via its 'nginx-errorlog-ip' child; stock rules 31301-31335 apply,
+  including 31315/31316 for NPM access-list basic-auth failures). The two decoders at the end of
+  this file are additional same-named siblings of that child: they only ADD fields
+  (npm.host, npm.method, url, npm.upstream) and never remove stock behaviour.
+-->
+
+<!-- proxy format (has upstream status and [Sent-to ...]) -->
+<decoder name="npm-access-proxy">
+  <parent>zeus</parent>
+  <prematch type="pcre2" offset="after_parent">\] \[Gzip \S+\] \[Sent-to \S+\] \\?"</prematch>
+  <regex type="pcre2" offset="after_parent">^(\S+) (.+?) (\d{3}) - (\S*) (\S+) (\S*) \\?"(.*?)\\?" \[Client (\S+)\] \[Length (\S+)\] \[Gzip \S+\] \[Sent-to (\S+)\] \\?"(.*?)\\?" \\?"(.*?)\\?"\s*$</regex>
+  <order>npm.cache,npm.upstream_status,status,npm.method,npm.scheme,npm.host,url,srcip,npm.bytes,npm.upstream,npm.user_agent,npm.referer</order>
+</decoder>
+
+<!-- standard format (no upstream) -->
+<decoder name="npm-access-standard">
+  <parent>zeus</parent>
+  <prematch type="pcre2" offset="after_parent">^\d{3} - \S* \S+ \S* \\?".*\] \[Gzip \S+\] \\?"</prematch>
+  <regex type="pcre2" offset="after_parent">^(\d{3}) - (\S*) (\S+) (\S*) \\?"(.*?)\\?" \[Client (\S+)\] \[Length (\S+)\] \[Gzip \S+\] \\?"(.*?)\\?" \\?"(.*?)\\?"\s*$</regex>
+  <order>status,npm.method,npm.scheme,npm.host,url,srcip,npm.bytes,npm.user_agent,npm.referer</order>
+</decoder>
+
+<!-- keeps the stock Zeus srcip extraction working now that 'zeus' has children -->
+<decoder name="npm-zeus-compat">
+  <parent>zeus</parent>
+  <regex offset="after_parent"> host=(\S+), </regex>
+  <order>srcip</order>
+</decoder>
+
+<!-- nginx error log: extra fields on top of the stock nginx-errorlog / nginx-errorlog-ip pair.
+     2026/01/01 12:00:00 [error] 31#31: *812 connect() failed (111: Connection refused) while connecting to upstream, client: 203.0.113.10, server: app.example.com, request: "GET /path HTTP/2.0", upstream: "http://198.51.100.20:8080/path", host: "app.example.com" -->
+<decoder name="nginx-errorlog-ip">
+  <parent>nginx-errorlog</parent>
+  <regex type="pcre2" offset="after_parent">, server: (\S*), request: \\?"(\S+) (\S+)</regex>
+  <order>npm.host,npm.method,url</order>
+</decoder>
+
+<decoder name="nginx-errorlog-ip">
+  <parent>nginx-errorlog</parent>
+  <regex type="pcre2" offset="after_parent">, upstream: \\?"([^"\\]+)</regex>
+  <order>npm.upstream</order>
+</decoder>
+
+<!-- ===== Optional syslog path =====
+     Lines relayed over RFC 3164 syslog with program name (tag) "npm-proxy" or "npm":
+       Jan  1 12:00:00 npmhost npm-proxy: [01/Jan/2026:12:00:00 +0000] - 200 200 - GET https ...
+     Once the pre-decoder has extracted a program name, decoders without <program_name> (zeus,
+     nginx-errorlog) are no longer tried, so this path needs its own parent. Do NOT use a tag that
+     contains "nginx" or "apache": the stock web-accesslog decoder claims those program names
+     first and the line would never reach these decoders. Same fields as the file path. -->
+<decoder name="npm-syslog">
+  <program_name>^npm-proxy$|^npm$</program_name>
+</decoder>
+
+<decoder name="npm-syslog-proxy">
+  <parent>npm-syslog</parent>
+  <prematch type="pcre2">^\[\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}\] .*\] \[Gzip \S+\] \[Sent-to \S+\] \\?"</prematch>
+  <regex type="pcre2">^\[[^\]]+\] (\S+) (.+?) (\d{3}) - (\S*) (\S+) (\S*) \\?"(.*?)\\?" \[Client (\S+)\] \[Length (\S+)\] \[Gzip \S+\] \[Sent-to (\S+)\] \\?"(.*?)\\?" \\?"(.*?)\\?"\s*$</regex>
+  <order>npm.cache,npm.upstream_status,status,npm.method,npm.scheme,npm.host,url,srcip,npm.bytes,npm.upstream,npm.user_agent,npm.referer</order>
+</decoder>
+
+<decoder name="npm-syslog-standard">
+  <parent>npm-syslog</parent>
+  <prematch type="pcre2">^\[\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}\] \d{3} - </prematch>
+  <regex type="pcre2">^\[[^\]]+\] (\d{3}) - (\S*) (\S+) (\S*) \\?"(.*?)\\?" \[Client (\S+)\] \[Length (\S+)\] \[Gzip \S+\] \\?"(.*?)\\?" \\?"(.*?)\\?"\s*$</regex>
+  <order>status,npm.method,npm.scheme,npm.host,url,srcip,npm.bytes,npm.user_agent,npm.referer</order>
+</decoder>
+
+<!-- error-log line over syslog: level, client, host, request, upstream (sibling decoders: each adds
+     its fields when present) -->
+<decoder name="npm-syslog-error">
+  <parent>npm-syslog</parent>
+  <prematch type="pcre2">^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} \[\w+\] </prematch>
+  <regex type="pcre2">^\S+ \S+ \[(\w+)\] </regex>
+  <order>npm.log_level</order>
+</decoder>
+
+<decoder name="npm-syslog-error">
+  <parent>npm-syslog</parent>
+  <regex type="pcre2">, client: ([^,\s]+), server: (\S*), request: \\?"(\S+) (\S+)</regex>
+  <order>srcip,npm.host,npm.method,url</order>
+</decoder>
+
+<decoder name="npm-syslog-error">
+  <parent>npm-syslog</parent>
+  <regex type="pcre2">, upstream: \\?"([^"\\]+)</regex>
+  <order>npm.upstream</order>
+</decoder>

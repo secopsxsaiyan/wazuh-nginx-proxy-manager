@@ -1,0 +1,200 @@
+<!--
+  Nginx Proxy Manager (NPM) classification + detection rules (paired with npm_decoders.xml).
+
+  ID RANGE: 101700-101718.
+
+  CHAIN: NPM access lines collected from files decode as children of the stock 'zeus' decoder
+  (see npm_decoders.xml), so the base rule 101700 is a child of the stock Zeus grouping rule 31200
+  and is keyed on npm.scheme, a field only the NPM decoders set. Lines from the optional syslog
+  path decode as 'npm-syslog' and enter at 101717 (access) / 101718 (error); everything below
+  hangs off both bases. File-collected error-log lines use the stock nginx rules (31300-31335);
+  101712 only adds an upstream-failure child of stock 31301. Certificate expiry events come from
+  poller/npm_certs.py as JSON lines (stock JSON decoder, integration=npm-certs).
+
+  RULE EVALUATION (verified with wazuh-logtest on 4.14.5):
+    - sibling rules are tried highest-level first, not in file order. The attack-path / JNDI rules
+      (L6) are siblings of 4xx (L3) / 5xx (L5) and always win, so a spoofed monitor User-Agent
+      cannot de-rate a probe;
+    - if_matched_sid counts only events whose FINAL rule was that sid. The monitor de-rate
+      (101705, L2, child of every status rule) therefore takes monitor checks out of the scan /
+      brute-force / outage composites on purpose (the monitor alerts on outages itself), and the
+      scan composite (101709, counts 101701) does not double-count 401/403 (101703, brute force)
+      or attack paths (101706, own composite 101708; header-only JNDI strings 101707 are single
+      alerts).
+
+  LEVELS (triage gate = level 10): single requests stay at L0-L6, frequency composites at L6-L8.
+  Internet-facing proxies are scanned continuously, and 401 bursts are common from single-page
+  apps with an expired session, so none of the web composites reaches L10. Only an imminent or
+  actual certificate expiry (101715, near-zero FP, outage within days) does.
+-->
+
+<group name="npm,web,accesslog,">
+
+  <!-- ===== Access log: base + status classes ===== -->
+  <rule id="101700" level="0">
+    <if_sid>31200</if_sid>
+    <field name="npm.scheme" type="pcre2">^https?$</field>
+    <description>NPM: $(npm.method) $(npm.host)$(url) $(status) from $(srcip)</description>
+    <group>npm_access,</group>
+  </rule>
+
+  <!-- same base for the optional syslog path (decoder npm-syslog, program name npm-proxy / npm) -->
+  <rule id="101717" level="0">
+    <decoded_as>npm-syslog</decoded_as>
+    <field name="npm.scheme" type="pcre2">^https?$</field>
+    <description>NPM: $(npm.method) $(npm.host)$(url) $(status) from $(srcip)</description>
+    <group>npm_access,</group>
+  </rule>
+
+  <rule id="101701" level="3">
+    <if_sid>101700, 101717</if_sid>
+    <status type="pcre2">^4\d\d$</status>
+    <description>NPM: client error $(status) $(npm.method) $(npm.host)$(url) from $(srcip)</description>
+    <group>npm_access,npm_4xx,</group>
+  </rule>
+
+  <rule id="101702" level="5">
+    <if_sid>101700, 101717</if_sid>
+    <status type="pcre2">^5\d\d$</status>
+    <description>NPM: server error $(status) $(npm.method) $(npm.host)$(url) from $(srcip) (upstream $(npm.upstream))</description>
+    <group>npm_access,npm_5xx,</group>
+  </rule>
+
+  <rule id="101703" level="3">
+    <if_sid>101701</if_sid>
+    <status type="pcre2">^40[13]$</status>
+    <description>NPM: access denied $(status) $(npm.method) $(npm.host)$(url) from $(srcip)</description>
+    <group>npm_access,npm_4xx,npm_auth_denied,</group>
+  </rule>
+
+  <rule id="101704" level="5">
+    <if_sid>101702</if_sid>
+    <status type="pcre2">^50[234]$</status>
+    <description>NPM: upstream unavailable $(status) for $(npm.host) (upstream $(npm.upstream), upstream status $(npm.upstream_status))</description>
+    <group>npm_access,npm_5xx,npm_gateway_error,</group>
+  </rule>
+
+  <!-- Uptime monitors poll every minute; a down or auth-protected target turns every check into a
+       4xx/5xx. De-rated and excluded from the composites (the monitor alerts on outages itself).
+       Extend the list with your own monitor's User-Agent. -->
+  <rule id="101705" level="2">
+    <if_sid>101701, 101702, 101703, 101704</if_sid>
+    <field name="npm.user_agent" type="pcre2">(?i)(Uptime-Kuma/|UptimeRobot/|Gatus/|Pingdom\.com_bot|StatusCake|Site24x7|Better ?Uptime|HetrixTools|updown\.io|Freshping)</field>
+    <description>NPM: uptime monitor check $(npm.host)$(url) status $(status)</description>
+    <group>npm_access,npm_monitor,</group>
+  </rule>
+
+  <!-- ===== Probes: common attack / recon paths (any status) ===== -->
+  <!-- If you host WordPress or phpMyAdmin behind NPM, remove those alternatives. -->
+  <rule id="101706" level="6">
+    <if_sid>101700, 101717</if_sid>
+    <url type="pcre2">(?i)(/\.(env|git|svn|hg|aws|ssh|htpasswd|DS_Store)(\b|/|$)|/wp-login\.php|/xmlrpc\.php|/wp-config\.php|/wp-includes/wlwmanifest\.xml|/phpmyadmin|/pma/|/myadmin/|/adminer\.php|/vendor/phpunit/.*eval-stdin\.php|/actuator/(env|heapdump)|/HNAP1|/boaform/|/cgi-bin/.*(/bin/(ba)?sh|\.sh\b)|(\.\.|%2e%2e|\.%2e|%2e\.)(/|%2f|\\|%5c)|/etc/passwd|win\.ini|\$\{jndi:|%24%7bjndi)</url>
+    <description>NPM: probe for sensitive / exploit path $(npm.host)$(url) from $(srcip) (status $(status))</description>
+    <mitre>
+      <id>T1595.003</id>
+    </mitre>
+    <group>npm_access,npm_attack,attack,</group>
+  </rule>
+
+  <!-- Log4Shell-style lookup string in a header (User-Agent / Referer) rather than the path. -->
+  <rule id="101707" level="6">
+    <if_sid>101700, 101717</if_sid>
+    <regex type="pcre2">(?i)\$\{(jndi|\$\{|lower:|upper:|env:)|%24%7b(jndi|%24%7b)</regex>
+    <description>NPM: JNDI / lookup injection string in request to $(npm.host) from $(srcip)</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>npm_access,npm_attack,attack,</group>
+  </rule>
+
+  <!-- ===== Frequency composites =====
+       101708 counts 101706 only: if_matched_group double-counts events of a rule that has two
+       parents (101700 and 101717), which made the burst fire on the 3rd probe. -->
+  <rule id="101708" level="8" frequency="5" timeframe="120">
+    <if_matched_sid>101706</if_matched_sid>
+    <same_source_ip />
+    <description>NPM: multiple attack-path probes from $(srcip) (5+ in 120s) - vulnerability scan</description>
+    <mitre>
+      <id>T1595.003</id>
+    </mitre>
+    <group>npm_access,npm_attack,npm_scan,attack,</group>
+  </rule>
+
+  <rule id="101709" level="6" frequency="20" timeframe="60">
+    <if_matched_sid>101701</if_matched_sid>
+    <same_source_ip />
+    <different_url />
+    <description>NPM: burst of client errors on different URLs from $(srcip) (20+ in 60s) - content discovery / scan</description>
+    <mitre>
+      <id>T1595.003</id>
+    </mitre>
+    <group>npm_access,npm_scan,recon,</group>
+  </rule>
+
+  <rule id="101710" level="8" frequency="15" timeframe="120">
+    <if_matched_sid>101703</if_matched_sid>
+    <same_source_ip />
+    <description>NPM: repeated 401/403 from $(srcip) (15+ in 120s, last $(npm.host)$(url)) - possible brute force</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+    <group>npm_access,npm_bruteforce,authentication_failures,</group>
+  </rule>
+
+  <rule id="101711" level="7" frequency="10" timeframe="120">
+    <if_matched_sid>101704</if_matched_sid>
+    <same_field>npm.host</same_field>
+    <description>NPM: upstream outage for $(npm.host) (10+ 502/503/504 in 120s, upstream $(npm.upstream))</description>
+    <group>npm_access,npm_outage,</group>
+  </rule>
+
+  <!-- ===== Error log (stock nginx decoder + fields added by npm_decoders.xml) ===== -->
+  <!-- error-log line relayed over the optional syslog path (decoder npm-syslog) -->
+  <rule id="101718" level="0">
+    <decoded_as>npm-syslog</decoded_as>
+    <field name="npm.log_level">\.+</field>
+    <description>NPM error log ($(npm.log_level)): $(npm.host) client $(srcip)</description>
+    <group>npm_error,</group>
+  </rule>
+
+  <rule id="101712" level="3">
+    <if_sid>31301, 101718</if_sid>
+    <match>while connecting to upstream|upstream timed out|no live upstreams</match>
+    <description>Nginx/NPM: upstream unreachable for $(npm.host) (upstream $(npm.upstream))</description>
+    <group>nginx,npm_error,npm_outage,</group>
+  </rule>
+
+</group>
+
+<!-- ===== TLS certificate expiry (poller/npm_certs.py JSON feed) ===== -->
+<group name="npm,certificate,">
+
+  <rule id="101713" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="integration">^npm-certs$</field>
+    <description>NPM TLS cert $(npm_cert.host): $(npm_cert.status), $(npm_cert.days_left) days left ($(npm_cert.issuer))</description>
+    <group>npm_cert,</group>
+  </rule>
+
+  <rule id="101714" level="8">
+    <if_sid>101713</if_sid>
+    <field name="npm_cert.status" type="pcre2">^(expiring|name_mismatch)$</field>
+    <description>NPM TLS cert for $(npm_cert.host) $(npm_cert.status): $(npm_cert.days_left) days left (expires $(npm_cert.not_after)) - check certificate renewal</description>
+    <group>npm_cert,</group>
+  </rule>
+
+  <rule id="101715" level="10">
+    <if_sid>101713</if_sid>
+    <field name="npm_cert.status" type="pcre2">^(critical|expired)$</field>
+    <description>NPM TLS cert for $(npm_cert.host) $(npm_cert.status): $(npm_cert.days_left) days left (expires $(npm_cert.not_after))</description>
+    <group>npm_cert,</group>
+  </rule>
+
+  <rule id="101716" level="5">
+    <if_sid>101713</if_sid>
+    <field name="npm_cert.status">^probe_error$</field>
+    <description>NPM TLS probe failed for $(npm_cert.host): $(npm_cert.error)</description>
+    <group>npm_cert,</group>
+  </rule>
+
+</group>

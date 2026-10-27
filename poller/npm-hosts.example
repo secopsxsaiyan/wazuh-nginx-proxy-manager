@@ -1,0 +1,5 @@
+# Hostnames whose TLS certificate npm_certs.py should check, one per line (# comments allowed).
+# Copy to e.g. /etc/npm-certs.hosts and list the domains your NPM proxy hosts serve.
+# Optional if you use --npm-conf / --npm-logs, which discover hostnames from NPM itself.
+app.example.com
+www.example.com
